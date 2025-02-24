@@ -1,4 +1,4 @@
-module github.com/bosniankicks/greenlight
+module github.com/SecretBots/greenlight
 
 go 1.23.5
 

@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SecretBots/greenlight/pkg/page"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/bosniankicks/greenlight/pkg/page"
 )
 
 type Browser struct {
@@ -29,11 +29,30 @@ type Browser struct {
 	messageMutex sync.Mutex
 	pid          int
 	isHeadless   bool
+	cookies      []Cookie
 }
 
-func GreenLight(execPath string, isHeadless bool, startURL string) *Browser {
+type Cookie struct {
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain"`
+	Path     string  `json:"path"`
+	Expires  float64 `json:"expires"`
+	HTTPOnly bool    `json:"httpOnly"`
+	Secure   bool    `json:"secure"`
+	Session  bool    `json:"session"`
+	SameSite string  `json:"sameSite"`
+}
+
+func GreenLight(execPath string, isHeadless bool, startURL string, sessionDir string) *Browser {
 	ctx, cancel := context.WithCancel(context.Background())
-	userDataDir := filepath.Join(os.TempDir(), fmt.Sprintf("greenlight_%s", uuid.New().String()))
+
+	var userDataDir string
+	if sessionDir != "" {
+		userDataDir = sessionDir
+	} else {
+		userDataDir = filepath.Join(os.TempDir(), fmt.Sprintf("greenlight_%s", uuid.New().String()))
+	}
 
 	browser := &Browser{
 		execPath:    execPath,
@@ -41,10 +60,16 @@ func GreenLight(execPath string, isHeadless bool, startURL string) *Browser {
 		cancel:      cancel,
 		userDataDir: userDataDir,
 		isHeadless:  isHeadless,
+		cookies:     make([]Cookie, 0),
 	}
 
 	if err := browser.launch(startURL); err != nil {
 		log.Fatalf("Failed to launch browser: %v", err)
+	}
+
+	// Load cookies from the browser after launch
+	if cookies, err := browser.GetCookies(); err == nil {
+		browser.cookies = cookies
 	}
 
 	return browser
@@ -207,4 +232,112 @@ func (b *Browser) RedLight() {
 
 	b.cancel()
 	log.Println("Browser closed successfully.")
+}
+
+func (b *Browser) GetCookies() ([]Cookie, error) {
+	params := map[string]interface{}{
+		"urls": []string{}, // Empty array means all cookies
+	}
+
+	response, err := b.SendCommandWithResponse("Network.getAllCookies", params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cookies: %v", err)
+	}
+
+	if result, ok := response["result"].(map[string]interface{}); ok {
+		if cookiesRaw, ok := result["cookies"].([]interface{}); ok {
+			cookiesBytes, err := json.Marshal(cookiesRaw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal cookies: %v", err)
+			}
+
+			var cookies []Cookie
+			if err := json.Unmarshal(cookiesBytes, &cookies); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal cookies: %v", err)
+			}
+
+			b.cookies = cookies
+
+			return cookies, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unexpected response format")
+}
+
+func (b *Browser) SetCookie(cookie Cookie) error {
+	params := map[string]interface{}{
+		"name":     cookie.Name,
+		"value":    cookie.Value,
+		"domain":   cookie.Domain,
+		"path":     cookie.Path,
+		"expires":  cookie.Expires,
+		"httpOnly": cookie.HTTPOnly,
+		"secure":   cookie.Secure,
+		"sameSite": cookie.SameSite,
+	}
+
+	_, err := b.SendCommandWithResponse("Network.setCookie", params)
+	if err != nil {
+		return fmt.Errorf("failed to set cookie: %v", err)
+	}
+
+	// Update local storage after successful cookie setting
+	found := false
+	for i, existingCookie := range b.cookies {
+		if existingCookie.Name == cookie.Name && existingCookie.Domain == cookie.Domain {
+			b.cookies[i] = cookie
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		b.cookies = append(b.cookies, cookie)
+	}
+
+	return nil
+}
+
+func (b *Browser) DeleteCookies(name, domain string) error {
+	params := map[string]interface{}{
+		"name":   name,
+		"domain": domain,
+	}
+
+	_, err := b.SendCommandWithResponse("Network.deleteCookies", params)
+	if err != nil {
+		return fmt.Errorf("failed to delete cookies: %v", err)
+	}
+
+	// Update local storage by removing matching cookies
+	var filteredCookies []Cookie
+	for _, cookie := range b.cookies {
+		if !(cookie.Name == name && cookie.Domain == domain) {
+			filteredCookies = append(filteredCookies, cookie)
+		}
+	}
+	b.cookies = filteredCookies
+
+	return nil
+}
+
+// Find a specific cookie by name and domain
+func (b *Browser) FindCookie(name, domain string) (Cookie, bool) {
+	for _, cookie := range b.cookies {
+		if cookie.Name == name && cookie.Domain == domain {
+			return cookie, true
+		}
+	}
+	return Cookie{}, false
+}
+
+// Refresh all cookies from the browser
+func (b *Browser) RefreshCookies() error {
+	cookies, err := b.GetCookies()
+	if err != nil {
+		return err
+	}
+	b.cookies = cookies
+	return nil
 }
