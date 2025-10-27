@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +18,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type ProxyConfig struct {
+	Host     string // proxy hostname or IP
+	Port     int    // proxy port
+	Username string // optional username
+	Password string // optional password
+	Protocol string // http or socks5
+}
+
 type Browser struct {
 	execPath     string
 	wsEndpoint   string
@@ -30,6 +39,7 @@ type Browser struct {
 	pid          int
 	isHeadless   bool
 	cookies      []Cookie
+	proxy        *ProxyConfig // added for proxy support
 }
 
 type Cookie struct {
@@ -44,7 +54,7 @@ type Cookie struct {
 	SameSite string  `json:"sameSite"`
 }
 
-func GreenLight(execPath string, isHeadless bool, startURL string, sessionDir string) *Browser {
+func GreenLight(execPath string, isHeadless bool, startURL string, sessionDir string, proxy *ProxyConfig) *Browser {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var userDataDir string
@@ -61,13 +71,14 @@ func GreenLight(execPath string, isHeadless bool, startURL string, sessionDir st
 		userDataDir: userDataDir,
 		isHeadless:  isHeadless,
 		cookies:     make([]Cookie, 0),
+		proxy:       proxy,
 	}
 
 	if err := browser.launch(startURL); err != nil {
 		log.Fatalf("Failed to launch browser: %v", err)
 	}
 
-	// Load cookies from the browser after launch
+	// Load cookies after launch
 	if cookies, err := browser.GetCookies(); err == nil {
 		browser.cookies = cookies
 	}
@@ -89,6 +100,18 @@ func (b *Browser) launch(startURL string) error {
 		args = append(args, "--headless=new")
 	}
 
+	// Apply proxy configuration if provided
+	if b.proxy != nil {
+		protocol := b.proxy.Protocol
+		if protocol == "" {
+			protocol = "http"
+		}
+		proxyArg := fmt.Sprintf("--proxy-server=%s://%s:%d", protocol, b.proxy.Host, b.proxy.Port)
+		args = append(args, proxyArg)
+
+		log.Printf("Using proxy: %s", proxyArg)
+	}
+
 	b.cmd = exec.CommandContext(b.context, b.execPath, args...)
 	if err := b.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start browser: %v", err)
@@ -97,11 +120,43 @@ func (b *Browser) launch(startURL string) error {
 	b.pid = b.cmd.Process.Pid
 	log.Printf("Chrome started with PID: %d", b.pid)
 
-	time.Sleep(time.Second)
+	// Allow Chrome to start
+	time.Sleep(1 * time.Second)
+
 	if err := b.attachToPage(); err != nil {
 		return err
 	}
 
+	// Inject proxy authentication headers if needed
+	if b.proxy != nil && b.proxy.Username != "" {
+		if err := b.injectProxyAuthHeader(); err != nil {
+			log.Printf("Warning: Failed to inject proxy auth header: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (b *Browser) injectProxyAuthHeader() error {
+	if b.conn == nil {
+		return fmt.Errorf("WebSocket connection not established")
+	}
+
+	authHeader := "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(fmt.Sprintf("%s:%s", b.proxy.Username, b.proxy.Password)),
+	)
+
+	params := map[string]interface{}{
+		"headers": map[string]interface{}{
+			"Proxy-Authorization": authHeader,
+		},
+	}
+
+	_, err := b.SendCommandWithResponse("Network.setExtraHTTPHeaders", params)
+	if err != nil {
+		return fmt.Errorf("failed to set proxy authorization header: %v", err)
+	}
+	log.Println("Proxy authentication header injected successfully.")
 	return nil
 }
 
